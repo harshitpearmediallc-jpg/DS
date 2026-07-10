@@ -1,0 +1,173 @@
+# =============================================================================
+# config.yaml — single source of truth for every tunable in the tool.
+#
+# RULE: no magic numbers in code. If a number influences a statistical or
+# business decision, it lives here with a comment explaining WHY it exists,
+# not just what it is. Media buyers and analysts should be able to retune the
+# tool by editing this file alone.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# data_source — which backend to read from and how its columns map.
+# The tool NEVER writes to the source. Read-only.
+# -----------------------------------------------------------------------------
+data_source:
+  # "file"  -> CSV/parquet on disk (offline testing, synthetic data)
+  # "sql"   -> SQLAlchemy against a Postgres/MySQL-style tracker replica
+  kind: file
+
+  file:
+    # Directory holding campaigns.(csv|parquet) and events.(csv|parquet).
+    path: data/synthetic
+    format: parquet          # csv | parquet
+
+  sql:
+    # SQLAlchemy URL. Point this at a READ-ONLY replica / read replica user.
+    # Example: postgresql+psycopg2://readonly_user:pw@host:5432/tracker
+    url: "postgresql+psycopg2://REPLACE_ME"
+    campaigns_table: campaigns
+    events_table: campaign_stats
+
+  # -------------------------------------------------------------------------
+  # column_map — maps OUR canonical field names (left) to the real tracker
+  # column names (right). This is the ONE place the real schema gets wired in.
+  # We do not hardcode the tracker's names anywhere else. See SCHEMA_ASSUMPTIONS.md.
+  # -------------------------------------------------------------------------
+  column_map:
+    campaigns:
+      campaign_id: campaign_id
+      name: name
+      offer: offer
+      start_time: start_time
+      end_time: end_time
+      status: status
+    events:
+      campaign_id: campaign_id
+      timestamp: timestamp        # time the SPEND/click occurred (see lag note)
+      postback_time: postback_time  # time the conversion/revenue landed; optional
+      spend: spend
+      clicks: clicks
+      conversions: conversions
+      revenue: revenue
+      # dimension columns (used as features / corroborating evidence only)
+      sub_id: sub_id
+      creative: creative
+      lander: lander
+      offer: offer
+      audience: audience
+      region: region
+      city: city
+
+# -----------------------------------------------------------------------------
+# ground_truth — how we decide a campaign's TRUE verdict for the backtest.
+# Only "mature" campaigns get a trustworthy verdict; everything else is excluded
+# from ground-truth accuracy claims.
+# -----------------------------------------------------------------------------
+ground_truth:
+  # A campaign needs at least this many TOTAL conversions over its life before
+  # we trust its profitable/unprofitable label. Default 100: by ~100 conversions
+  # the law of large numbers has mostly tamed per-conversion payout variance.
+  maturity_min_conversions: 100
+
+  # Alternative/additional maturity gate: minimum total spend (dollars).
+  # A campaign qualifies as mature if it meets EITHER the conversion OR spend gate
+  # (see maturity_logic). Set to null to ignore spend entirely.
+  maturity_min_spend: null
+  maturity_logic: or            # "or" | "and" — how to combine the two gates
+
+  # Verdict is computed on the MATURE PORTION of life (after warmup), using
+  # ACTUAL payouts (revenue - spend), never assumed conversion values.
+  # profit > 0 -> winner ; profit <= 0 -> loser.
+
+  # Borderline exclusion band on the FIRST pass. Campaigns whose mature ROI falls
+  # within +/- this fraction of break-even are too close to call and are dropped
+  # from headline accuracy (they inflate "error" without being real mistakes).
+  # e.g. 0.05 => exclude campaigns finishing between -5% and +5% ROI.
+  # Set to 0.0 to keep all campaigns.
+  borderline_roi_band: 0.05
+
+# -----------------------------------------------------------------------------
+# backtest — Phase 1 parameters.
+# -----------------------------------------------------------------------------
+backtest:
+  # Decision is reconstructed by SAMPLE SIZE, not calendar time. For each
+  # campaign we rewind to the moment it had accumulated exactly this many
+  # cumulative conversions and ask "what would the naive rule have said?"
+  decision_conversion_points: [5, 10, 20, 30, 50, 75, 100]
+
+  # The conversion count at which buyers ACTUALLY pull the trigger in practice.
+  # The headline dollar figure is priced at this point (reality, not the ideal).
+  typical_decision_conversions: 10
+
+  # Naive rule under test: cumulative ROI > this -> "scale"; else "kill".
+  # 0.0 == break-even. This is the buyers' current mental model.
+  naive_scale_threshold_roi: 0.0
+
+  # Error rate considered "tolerable" when reading off the v1 trust threshold N.
+  # We pick the smallest decision-conversion point whose misclassification rate
+  # drops at or below this. 0.10 => trust a call once it is <=10% wrong.
+  tolerable_error_rate: 0.10
+
+# -----------------------------------------------------------------------------
+# data_quality — guard against under-tracked spend inflating ROI.
+# Campaigns with zero spend or an implausibly low implied CPC (spend/clicks) have
+# untrustworthy ROI. We flag and report them; optionally exclude from the headline.
+# -----------------------------------------------------------------------------
+data_quality:
+  flag_min_cpc: 0.05                     # implied CPC below this $ ...
+  flag_min_roi_for_lowcpc: 3.0           # ...AND ROI above this (300%) => under-tracked
+  exclude_untracked_from_headline: false # keep by default (headline robust); true to drop
+
+# -----------------------------------------------------------------------------
+# lag — conversion / postback lag guard.
+# Postbacks arrive AFTER the spend that generated them, so early cumulative ROI
+# is structurally biased low. We must not mistake "delayed conversions landing"
+# for "a losing campaign recovering."
+# -----------------------------------------------------------------------------
+lag:
+  # If postback_time is available we align each conversion's revenue back to the
+  # spend/click time within this attribution window. Conversions landing later
+  # than the window are still counted but flagged as long-lag.
+  attribution_window_hours: 168     # 7 days — typical affiliate postback horizon
+
+  # When postback_time is NOT available, we approximate lag by shifting revenue
+  # earlier by this many hours as a sensitivity check. Used only for the
+  # lag-vs-genuine-recovery decomposition, never for the primary verdict.
+  assumed_lag_hours: 72
+
+# -----------------------------------------------------------------------------
+# confidence — Phase 2 parameters (built only after Phase 1 is reviewed).
+# Included now so the config is complete; Phase 2 code reads these.
+# -----------------------------------------------------------------------------
+confidence:
+  # Two-sided significance level for "is ROI distinguishable from break-even?"
+  # 0.05 => 95% confidence interval on the profit estimate.
+  significance_level: 0.05
+
+  # Below the Phase-1 trust threshold N conversions, default to HOLD regardless
+  # of apparent ROI. This value is OVERWRITTEN by the exported Phase-1 result
+  # (see thresholds_out); the number here is only a fallback if Phase 1 hasn't run.
+  min_conversions_to_trust: 30
+
+  # Bootstrap resamples for the ROI confidence interval. 2000 is plenty for a
+  # stable 95% interval without being slow.
+  bootstrap_iterations: 2000
+
+  # Regime-change detection: how many recent conversions form the "recent window"
+  # compared against the prior window when checking for a real level shift.
+  regime:
+    recent_window_conversions: 30
+    cusum_threshold_sigma: 4.0   # CUSUM alarm when drift exceeds this many sigma
+
+# -----------------------------------------------------------------------------
+# io — where exported artifacts go.
+# -----------------------------------------------------------------------------
+io:
+  outputs_dir: outputs
+  # Phase 1 writes the learned trust threshold + summary here; Phase 2 reads it.
+  thresholds_out: outputs/phase1_thresholds.yaml
+  money_chart_out: outputs/money_chart.png
+  recommendation_log: outputs/recommendation_log.jsonl
+
+# Reproducibility for the synthetic generator and any bootstrap sampling.
+random_seed: 42

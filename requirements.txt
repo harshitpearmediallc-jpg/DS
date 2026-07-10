@@ -1,0 +1,10 @@
+# Lean, justified dependency list.
+pandas>=2.0        # tabular data, groupby, time handling
+numpy>=1.24        # vectorised math, RNG for the synthetic harness
+scipy>=1.10        # statistical primitives (used in Phase 2 confidence intervals)
+statsmodels>=0.14  # regime/level-shift + calibration tooling (Phase 2)
+matplotlib>=3.7    # the money chart
+pyyaml>=6.0        # config.yaml + exported thresholds
+sqlalchemy>=2.0    # read-only SQL DataSource
+pyarrow>=12.0      # parquet I/O for offline/synthetic data
+pytest>=7.0        # test harness for the statistical core
